@@ -1,0 +1,32 @@
+# Forge harness configuration
+# Copy to ~/.forge/config.yaml for global settings,
+# or keep as .forge.yaml in a project directory for project-local settings.
+
+backend: ollama
+model: qwen3.6:27b
+max_tokens: 8096
+context_window: 32768
+compact_at: 0.80
+budget_fraction: 0.90
+stream: true
+
+max_depth: 4
+max_iterations: 20
+
+memory_path: ~/.forge/memory.json
+
+# Tools that require explicit user confirmation before running.
+# Uncomment to enable:
+# permissions:
+#   require_confirm:
+#     - write_file
+#     - bash
+
+# Shell hooks run around tool calls.
+# hooks:
+#   - on: pre
+#     tool: bash
+#     cmd: echo "[hook] about to run bash"
+#   - on: post
+#     tool: "*"
+#     cmd: echo "[hook] tool finished"

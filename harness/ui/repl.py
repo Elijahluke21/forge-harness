@@ -1,0 +1,408 @@
+import asyncio
+import json
+import subprocess
+from pathlib import Path
+
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.rule import Rule
+from rich.spinner import Spinner
+from rich.text import Text
+
+from harness.agent import Agent, SpawnEvent
+from harness.context import checkpoint
+from harness.memory.distill import distill
+from harness.prompt import build_system_prompt
+
+console = Console()
+
+COMMANDS = {
+    "/exit":              "Quit Forge (auto-distills memory on exit).",
+    "/quit":              "Quit Forge.",
+    "/clear":             "Clear conversation history.",
+    "/history":           "Show message count.",
+    "/save [path]":       "Save conversation checkpoint.",
+    "/load [path]":       "Load conversation checkpoint.",
+    "/distill":           "Extract memorable facts from this conversation.",
+    "/memory":            "Show all stored memories.",
+    "/forget <key>":      "Delete a memory by key.",
+    "/stats":             "Show session stats.",
+    "/export [md|json]":  "Export conversation to file.",
+    "/help":              "Show this help.",
+}
+
+BANNER = """
+███████╗ ██████╗ ██████╗  ██████╗ ███████╗
+██╔════╝██╔═══██╗██╔══██╗██╔════╝ ██╔════╝
+█████╗  ██║   ██║██████╔╝██║  ███╗█████╗
+██╔══╝  ██║   ██║██╔══██╗██║   ██║██╔══╝
+██║     ╚██████╔╝██║  ██║╚██████╔╝███████╗
+╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝
+"""
+
+_BRANCH = "├─"
+_LAST   = "└─"
+_PIPE   = "│ "
+_SPACE  = "  "
+
+
+def _tree_prefix(depth: int) -> str:
+    if depth == 0:
+        return ""
+    return (_PIPE + _SPACE) * (depth - 1) + _BRANCH + " "
+
+
+def _print_banner(agent: Agent) -> None:
+    console.print(BANNER, style="bold cyan", highlight=False)
+    console.print(f"  model   : [bold]{agent.client.model}[/bold]")
+    console.print(f"  tools   : [bold]{', '.join(agent.registry.names())}[/bold]")
+    console.print(f"  type [bold]/help[/bold] for commands, [bold]Ctrl+D[/bold] to exit\n")
+
+
+# ---------------------------------------------------------------------------
+# Streaming display  (6.1 + 6.2)
+# ---------------------------------------------------------------------------
+
+class _StreamRenderer:
+    """
+    Renders streaming text chunks to the terminal.
+    Qwen3 wraps thinking in <think>...</think> — shown in dim italic.
+    """
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+
+    def chunk(self, text: str) -> None:
+        self._buf += text
+        # Detect think open/close in accumulated buffer
+        while True:
+            if not self._in_think:
+                if "<think>" in self._buf:
+                    before, _, rest = self._buf.partition("<think>")
+                    if before:
+                        console.print(before, end="", highlight=False)
+                    console.print("[dim italic]", end="", highlight=False)
+                    self._in_think = True
+                    self._buf = rest
+                else:
+                    # Print everything except a potential partial tag at the end
+                    safe = self._buf if "<" not in self._buf else self._buf[:self._buf.rfind("<")]
+                    if safe:
+                        console.print(safe, end="", highlight=False)
+                        self._buf = self._buf[len(safe):]
+                    break
+            else:
+                if "</think>" in self._buf:
+                    inside, _, rest = self._buf.partition("</think>")
+                    if inside:
+                        console.print(inside, end="", highlight=False)
+                    console.print("[/dim italic]", end="", highlight=False)
+                    self._in_think = False
+                    self._buf = rest
+                else:
+                    safe = self._buf if "<" not in self._buf else self._buf[:self._buf.rfind("<")]
+                    if safe:
+                        console.print(safe, end="", highlight=False)
+                        self._buf = self._buf[len(safe):]
+                    break
+
+    def flush(self) -> None:
+        if self._buf:
+            console.print(self._buf, end="", highlight=False)
+            self._buf = ""
+        if self._in_think:
+            console.print("[/dim italic]", end="", highlight=False)
+            self._in_think = False
+
+
+# ---------------------------------------------------------------------------
+# Tool + spawn callbacks
+# ---------------------------------------------------------------------------
+
+def on_tool(name: str, inputs: dict, result: str, depth: int = 0) -> None:
+    indent = "  " * (depth + 1)
+
+    if name == "__compact__":
+        console.print(Text(f"{indent}◎  [context compacted] {result}", style="bold yellow"))
+        return
+
+    summary = repr(result.strip()[:72])
+    arg_str = ", ".join(f"{k}={repr(str(v)[:36])}" for k, v in inputs.items())
+    style = "dim cyan" if depth == 0 else "dim magenta"
+    console.print(Text(f"{indent}⚙  {name}({arg_str}) → {summary}", style=style))
+
+
+def on_spawn(event: SpawnEvent) -> None:
+    prefix = _tree_prefix(event.depth)
+    role_tag = f"[{event.role}] " if event.role else ""
+    task_preview = event.task[:64] + ("…" if len(event.task) > 64 else "")
+
+    if event.kind == "start":
+        console.print(Text(f"{prefix}⬡ agent depth={event.depth} {role_tag}← {task_preview!r}",
+                           style="bold yellow"))
+    elif event.kind == "retry":
+        console.print(Text(f"{prefix}↺ retrying depth={event.depth} {role_tag}",
+                           style="bold orange3"))
+    elif event.kind == "cached":
+        console.print(Text(f"{prefix}⚡ cached depth={event.depth} {role_tag}← {task_preview!r}",
+                           style="dim green"))
+    else:
+        calls = event.result.tool_calls_made if event.result else 0
+        retried = " (retried)" if (event.result and event.result.retried) else ""
+        console.print(Text(f"{prefix}✓ depth={event.depth} done ({calls} tool calls{retried})",
+                           style="dim green"))
+
+
+# ---------------------------------------------------------------------------
+# Permissions  (6.3)
+# ---------------------------------------------------------------------------
+
+async def confirm_tool(name: str, inputs: dict) -> bool:
+    preview = ", ".join(f"{k}={repr(str(v)[:60])}" for k, v in inputs.items())
+    console.print(f"\n[yellow]⚠  Permission required:[/yellow] [bold]{name}[/bold]({preview})")
+    try:
+        answer = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: input("  Allow? [y/N] ")
+        )
+        return answer.strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Hooks  (6.4)
+# ---------------------------------------------------------------------------
+
+def run_hooks(hooks: list[dict], timing: str, tool_name: str) -> None:
+    for hook in hooks:
+        if hook.get("on") != timing:
+            continue
+        pattern = hook.get("tool", "*")
+        if pattern != "*" and pattern != tool_name:
+            continue
+        cmd = hook.get("cmd", "")
+        if cmd:
+            try:
+                subprocess.run(cmd, shell=True, check=False,
+                               env={"FORGE_TOOL": tool_name})
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Export  (6.6)
+# ---------------------------------------------------------------------------
+
+def _export_markdown(agent: Agent, path: str) -> None:
+    lines = [f"# Forge Session Export\n"]
+    for msg in agent.messages:
+        role = msg["role"]
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            lines.append(f"## {role.title()}\n\n{content}\n")
+        elif isinstance(content, list):
+            header_done = False
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type", "")
+                if btype == "text" and block["text"].strip():
+                    if not header_done:
+                        lines.append(f"## {role.title()}\n")
+                        header_done = True
+                    lines.append(f"{block['text']}\n")
+                elif btype == "tool_use":
+                    lines.append(f"\n**Tool:** `{block['name']}`\n```json\n{json.dumps(block['input'], indent=2)}\n```\n")
+                elif btype == "tool_result":
+                    val = block.get("content", "")
+                    lines.append(f"\n**Result:**\n```\n{str(val)[:500]}\n```\n")
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Stats + distillation
+# ---------------------------------------------------------------------------
+
+def _print_stats(agent: Agent) -> None:
+    if agent.session_stats:
+        console.print(f"[dim]Session: {agent.session_stats.summary()}[/dim]")
+
+
+async def _run_distill(agent: Agent) -> None:
+    if not agent.memory_store:
+        console.print("[dim]No memory store attached.[/dim]")
+        return
+    console.print("[dim]Distilling...[/dim]")
+    written = await distill(agent.messages, agent.client, agent.memory_store)
+    if written:
+        console.print(f"[dim]Saved {len(written)} memor{'y' if len(written)==1 else 'ies'}: "
+                      f"{', '.join(written)}[/dim]")
+    else:
+        console.print("[dim]Nothing new to remember.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Command handler
+# ---------------------------------------------------------------------------
+
+def _handle_command(raw: str, agent: Agent) -> bool:
+    parts = raw.strip().split(None, 1)
+    cmd = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if cmd in ("/exit", "/quit"):
+        console.print("\n[dim]Goodbye.[/dim]")
+        return True
+    if cmd == "/clear":
+        agent.messages.clear()
+        console.print("[dim]History cleared.[/dim]")
+    elif cmd == "/history":
+        console.print(f"[dim]{len(agent.messages)} messages in history.[/dim]")
+    elif cmd == "/save":
+        path = arg or "forge_checkpoint.json"
+        checkpoint.save(agent.messages, path, agent.system)
+        console.print(f"[dim]Checkpoint saved to {path}[/dim]")
+    elif cmd == "/load":
+        path = arg or "forge_checkpoint.json"
+        try:
+            msgs, _ = checkpoint.load(path)
+            agent.messages.clear()
+            agent.messages.extend(msgs)
+            console.print(f"[dim]Loaded {len(msgs)} messages from {path}[/dim]")
+        except FileNotFoundError:
+            console.print(f"[red]File not found:[/red] {path}")
+    elif cmd == "/memory":
+        if not agent.memory_store:
+            console.print("[dim]No memory store attached.[/dim]")
+        else:
+            entries = agent.memory_store.all()
+            if not entries:
+                console.print("[dim]Memory is empty.[/dim]")
+            else:
+                console.print(Rule("Memory", style="dim"))
+                for e in entries:
+                    tag_str = f" [dim][{', '.join(e.tags)}][/dim]" if e.tags else ""
+                    console.print(f"  [bold cyan]{e.key}[/bold cyan]{tag_str}: {e.content}")
+                console.print(Rule(style="dim"))
+    elif cmd == "/forget":
+        if not agent.memory_store:
+            console.print("[dim]No memory store.[/dim]")
+        elif not arg:
+            console.print("[red]Usage:[/red] /forget <key>")
+        elif agent.memory_store.delete(arg):
+            console.print(f"[dim]Forgot: {arg}[/dim]")
+        else:
+            console.print(f"[red]No memory:[/red] {arg}")
+    elif cmd == "/export":
+        fmt = arg.strip().lower() or "md"
+        if fmt in ("md", "markdown"):
+            path = "forge_export.md"
+            _export_markdown(agent, path)
+            console.print(f"[dim]Exported to {path}[/dim]")
+        elif fmt == "json":
+            path = "forge_export.json"
+            checkpoint.save(agent.messages, path, agent.system)
+            console.print(f"[dim]Exported to {path}[/dim]")
+        else:
+            console.print(f"[red]Unknown format:[/red] {fmt}. Use 'md' or 'json'.")
+    elif cmd == "/help":
+        console.print(Rule("Commands", style="dim"))
+        for c, desc in COMMANDS.items():
+            console.print(f"  [bold cyan]{c:<24}[/bold cyan] {desc}")
+        console.print(Rule(style="dim"))
+    else:
+        console.print(f"[red]Unknown command:[/red] {cmd}  (type /help)")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Main REPL
+# ---------------------------------------------------------------------------
+
+async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = None) -> None:
+    _print_banner(agent)
+    _hooks = hooks or []
+
+    # Wrap tool registry with hook execution
+    if _hooks:
+        orig_execute = agent.registry.execute
+
+        async def hooked_execute(name: str, inputs: dict) -> str:
+            run_hooks(_hooks, "pre", name)
+            result = await orig_execute(name, inputs)
+            run_hooks(_hooks, "post", name)
+            return result
+
+        agent.registry.execute = hooked_execute  # type: ignore
+
+    while True:
+        try:
+            prompt = "forge> "
+            if agent.session_stats and agent.session_stats.agents_spawned:
+                s = agent.session_stats
+                prompt = f"forge [{s.agents_spawned}↓ {s.tool_calls}⚙]> "
+            user_input = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: input(prompt)
+            )
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Goodbye.[/dim]")
+            break
+
+        user_input = user_input.strip()
+        if not user_input:
+            continue
+
+        if user_input.startswith("/"):
+            parts = user_input.strip().split(None, 1)
+            first = parts[0].lower()
+            if first == "/distill":
+                await _run_distill(agent)
+                continue
+            if first == "/stats":
+                _print_stats(agent)
+                continue
+            if _handle_command(user_input, agent):
+                _print_stats(agent)
+                if agent.memory_store and agent.messages:
+                    console.print("[dim]Distilling session memories...[/dim]")
+                    await _run_distill(agent)
+                break
+            continue
+
+        console.print()
+
+        # Set up streaming renderer for this turn
+        renderer: _StreamRenderer | None = None
+        chunk_fn = None
+        if stream:
+            renderer = _StreamRenderer()
+            chunk_fn = renderer.chunk
+            agent.on_stream_chunk = chunk_fn
+
+        try:
+            answer = await agent.run(user_input)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+            if agent.messages and agent.messages[-1]["role"] == "user":
+                agent.messages.pop()
+            continue
+        finally:
+            agent.on_stream_chunk = None
+
+        if renderer:
+            renderer.flush()
+            console.print()  # newline after streamed text
+        else:
+            console.print()
+            console.print(Markdown(answer))
+
+        # Token bar
+        if agent.context_manager:
+            cm = agent.context_manager
+            pct = cm.usage_fraction
+            filled = int(pct * 20)
+            bar = "█" * filled + "░" * (20 - filled)
+            style = "green" if pct < 0.70 else ("yellow" if pct < 0.85 else "red")
+            console.print(Text(f"  ctx [{bar}] {cm.usage_summary}", style=f"dim {style}"))
+
+        console.print()
