@@ -216,7 +216,7 @@ class _StreamRenderer:
 
 async def _run_with_spinner(coro) -> str:
     """
-    Non-streaming: live 'Thinking… Xs' counter while the model works,
+    Non-streaming: 'Thinking… Xs' at the bottom while the model works,
     then a frozen 'Thought for Xs' header above the printed response.
     """
     start = time.monotonic()
@@ -242,22 +242,33 @@ async def _run_with_spinner(coro) -> str:
 
 async def _run_streaming(agent: Agent, user_input: str) -> str:
     """
-    Streaming: show 'Thinking… Xs' until the first token arrives, then
-    transition to live streaming output.
+    Streaming with a persistent bottom status bar.
 
-    Any chunks that arrive while the Live display is still active are buffered
-    and flushed immediately after — nothing is lost.
+    Timeline:
+      [press Enter]
+        Live bottom: '◆ Thinking… Xs'          ← counting up until first token
+      [first token]
+        Above Live:  '◆ Thought for Xs'         ← frozen, stays visible
+        Live bottom: '◆ Deliberating… (Xs ↓ N tok)'  ← updates while response streams
+      [response complete]
+        Live exits — footer is printed by the caller
+
+    console.print() inside a Live context prints ABOVE the live area, so
+    streaming chunks appear above while the status line stays at the bottom.
+    Chunks that arrive before the Live→streaming transition is committed are
+    buffered so no tokens are lost.
     """
     start = time.monotonic()
-    first_chunk_event = asyncio.Event()
-    live_done = asyncio.Event()
+    first_chunk = asyncio.Event()
+    live_unlocked = asyncio.Event()
     buffered: list[str] = []
     renderer = _StreamRenderer()
+    approx_tokens = [0]
 
     def on_chunk(text: str) -> None:
-        first_chunk_event.set()
-        if not live_done.is_set():
-            # Live display still active — buffer rather than printing now
+        first_chunk.set()
+        approx_tokens[0] += max(1, len(text) // 4)
+        if not live_unlocked.is_set():
             buffered.append(text)
         else:
             renderer.chunk(text)
@@ -265,31 +276,45 @@ async def _run_streaming(agent: Agent, user_input: str) -> str:
     agent.on_stream_chunk = on_chunk
     task = asyncio.ensure_future(agent.run(user_input))
 
-    # Live "Thinking…" counter until first token arrives (transient → erased on exit)
-    with Live(console=console, refresh_per_second=8, transient=True) as live:
-        while not first_chunk_event.is_set() and not task.done():
-            elapsed = time.monotonic() - start
-            live.update(Text.assemble(
+    def _status() -> Text:
+        elapsed = time.monotonic() - start
+        if not first_chunk.is_set():
+            return Text.assemble(
                 ("  ◆ Thinking… ", "dim yellow"),
                 (f"{elapsed:.0f}s", "bold dim yellow"),
-            ))
+            )
+        tok = approx_tokens[0]
+        return Text.assemble(
+            ("  ◆ Deliberating…  ", "dim yellow"),
+            (f"({elapsed:.0f}s", "dim"),
+            ("  ↓ ", "dim cyan"),
+            (f"{tok:,} tok)", "dim"),
+        )
+
+    with Live(_status(), console=console, refresh_per_second=8) as live:
+        # Phase 1: no tokens yet — show Thinking counter
+        while not first_chunk.is_set() and not task.done():
+            live.update(_status())
             await asyncio.sleep(0.12)
 
-    # Freeze elapsed time, print a persistent "Thought for Xs" header.
-    # This stays visible above the response while it streams.
-    elapsed_thinking = time.monotonic() - start
-    console.print(Text.assemble(
-        ("  ◆ Thought for ", "dim yellow"),
-        (f"{elapsed_thinking:.0f}s", "bold yellow"),
-    ))
-    console.print()
+        # Transition: print frozen "Thought for Xs" above the live area
+        elapsed_thinking = time.monotonic() - start
+        console.print(Text.assemble(
+            ("  ◆ Thought for ", "dim yellow"),
+            (f"{elapsed_thinking:.0f}s", "bold yellow"),
+        ))
+        console.print()
 
-    # Unlock direct rendering and flush chunks buffered during the Live window
-    live_done.set()
-    for chunk in buffered:
-        renderer.chunk(chunk)
+        # Unlock direct rendering and flush any buffered pre-transition chunks
+        live_unlocked.set()
+        for chunk in buffered:
+            renderer.chunk(chunk)
 
-    # Wait for completion; remaining tokens arrive via on_chunk → renderer.chunk
+        # Phase 2: response streams above; status bar stays at bottom
+        while not task.done():
+            live.update(_status())
+            await asyncio.sleep(0.12)
+
     answer = await task
     renderer.flush()
     console.print()
