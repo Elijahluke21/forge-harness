@@ -1,7 +1,6 @@
 import asyncio
 import json
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -120,39 +119,19 @@ def _build_status_line(agent: Agent) -> str:
 
 async def _get_input(agent: Agent, prompt_str: str) -> str:
     """
-    Read user input with both separator rules visible while typing.
-
-    Prints the status info, top rule, prompt line, and bottom rule —
-    then uses ANSI cursor-up to reposition the cursor on the prompt line
-    so the bottom rule is already visible below before the user types.
-    After Enter, advances past the bottom rule so subsequent output is clean.
+    Print status info + top rule, prompt user, then bottom rule.
+    Both rules are visible — top before typing, bottom immediately after Enter.
     """
-    width = console.width
-    rule_plain = "─" * width
-
-    # Status + top rule via Rich (handles markup / colour resets cleanly)
     console.print(_build_status_line(agent))
     console.rule(characters="─", style="dim")
 
-    # Print the prompt text, a newline, then the bottom rule, then a newline.
-    # This puts cursor at the start of a blank line below the bottom rule.
-    sys.stdout.write(prompt_str + "\n")
-    sys.stdout.write("\x1b[2m" + rule_plain + "\x1b[0m\n")
-
-    # Move cursor back up 2 lines and right to end of prompt text,
-    # so input() echoes on the prompt line with the bottom rule below.
-    sys.stdout.write(f"\x1b[2A\x1b[{len(prompt_str)}C")
-    sys.stdout.flush()
-
     loop = asyncio.get_event_loop()
     try:
-        line = await loop.run_in_executor(None, lambda: input(""))
+        line = await loop.run_in_executor(None, lambda: input(prompt_str))
     except (EOFError, KeyboardInterrupt):
         raise
 
-    # After Enter the cursor sits on the bottom rule line — skip past it.
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+    console.rule(characters="─", style="dim")
     return line
 
 
@@ -242,32 +221,22 @@ async def _run_with_spinner(coro) -> str:
 
 async def _run_streaming(agent: Agent, user_input: str) -> str:
     """
-    Streaming with a persistent bottom status bar.
+    Streaming: Live 'Thinking… Xs' until the first token (transient, erases
+    itself), then a frozen '◆ Thought for Xs' header stays visible above the
+    response as it streams normally with no Live context active.
 
-    Timeline:
-      [press Enter]
-        Live bottom: '◆ Thinking… Xs'          ← counting up until first token
-      [first token]
-        Above Live:  '◆ Thought for Xs'         ← frozen, stays visible
-        Live bottom: '◆ Deliberating… (Xs ↓ N tok)'  ← updates while response streams
-      [response complete]
-        Live exits — footer is printed by the caller
-
-    console.print() inside a Live context prints ABOVE the live area, so
-    streaming chunks appear above while the status line stays at the bottom.
-    Chunks that arrive before the Live→streaming transition is committed are
-    buffered so no tokens are lost.
+    The Live display is intentionally stopped before any response text prints.
+    Rich's Live refresh cycle overwrites mid-line console.print() output, so
+    keeping Live active during streaming silently swallows the response text.
     """
     start = time.monotonic()
     first_chunk = asyncio.Event()
     live_unlocked = asyncio.Event()
     buffered: list[str] = []
     renderer = _StreamRenderer()
-    approx_tokens = [0]
 
     def on_chunk(text: str) -> None:
         first_chunk.set()
-        approx_tokens[0] += max(1, len(text) // 4)
         if not live_unlocked.is_set():
             buffered.append(text)
         else:
@@ -276,44 +245,28 @@ async def _run_streaming(agent: Agent, user_input: str) -> str:
     agent.on_stream_chunk = on_chunk
     task = asyncio.ensure_future(agent.run(user_input))
 
-    def _status() -> Text:
-        elapsed = time.monotonic() - start
-        if not first_chunk.is_set():
-            return Text.assemble(
+    # Phase 1: Live thinking counter — transient so it erases on exit
+    with Live(console=console, refresh_per_second=8, transient=True) as live:
+        while not first_chunk.is_set() and not task.done():
+            elapsed = time.monotonic() - start
+            live.update(Text.assemble(
                 ("  ◆ Thinking… ", "dim yellow"),
                 (f"{elapsed:.0f}s", "bold dim yellow"),
-            )
-        tok = approx_tokens[0]
-        return Text.assemble(
-            ("  ◆ Deliberating…  ", "dim yellow"),
-            (f"({elapsed:.0f}s", "dim"),
-            ("  ↓ ", "dim cyan"),
-            (f"{tok:,} tok)", "dim"),
-        )
-
-    with Live(_status(), console=console, refresh_per_second=8) as live:
-        # Phase 1: no tokens yet — show Thinking counter
-        while not first_chunk.is_set() and not task.done():
-            live.update(_status())
+            ))
             await asyncio.sleep(0.12)
 
-        # Transition: print frozen "Thought for Xs" above the live area
-        elapsed_thinking = time.monotonic() - start
-        console.print(Text.assemble(
-            ("  ◆ Thought for ", "dim yellow"),
-            (f"{elapsed_thinking:.0f}s", "bold yellow"),
-        ))
-        console.print()
+    # Live is gone. Freeze elapsed and print a persistent header above response.
+    elapsed_thinking = time.monotonic() - start
+    console.print(Text.assemble(
+        ("  ◆ Thought for ", "dim yellow"),
+        (f"{elapsed_thinking:.0f}s", "bold yellow"),
+    ))
+    console.print()
 
-        # Unlock direct rendering and flush any buffered pre-transition chunks
-        live_unlocked.set()
-        for chunk in buffered:
-            renderer.chunk(chunk)
-
-        # Phase 2: response streams above; status bar stays at bottom
-        while not task.done():
-            live.update(_status())
-            await asyncio.sleep(0.12)
+    # Phase 2: stream with no Live active — output is reliable
+    live_unlocked.set()
+    for chunk in buffered:
+        renderer.chunk(chunk)
 
     answer = await task
     renderer.flush()
