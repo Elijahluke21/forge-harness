@@ -1,12 +1,13 @@
 import asyncio
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
-from rich.spinner import Spinner
 from rich.text import Text
 
 from harness.agent import Agent, SpawnEvent
@@ -45,6 +46,8 @@ _LAST   = "└─"
 _PIPE   = "│ "
 _SPACE  = "  "
 
+_SESSION_START = time.monotonic()
+
 
 def _tree_prefix(depth: int) -> str:
     if depth == 0:
@@ -60,7 +63,80 @@ def _print_banner(agent: Agent) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Streaming display  (6.1 + 6.2)
+# Input box layout
+#
+#   [status info line]
+#   ─────────────────────────────────   ← top rule
+#   forge> user types here              ← prompt (cursor here while typing)
+#   ─────────────────────────────────   ← bottom rule (visible while typing)
+#   ◆ Thinking… 4s → ◆ Thought for 4s  ← persists above the response
+#   response streams here…
+#   [footer: elapsed · tokens · ctx]
+# ---------------------------------------------------------------------------
+
+def _uptime_str() -> str:
+    total = int(time.monotonic() - _SESSION_START)
+    m, s = divmod(total, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def _build_status_line(agent: Agent) -> str:
+    """Return the status info markup string (no newline)."""
+    seg: list[str] = []
+    seg.append(f"[bold cyan]{agent.client.model}[/bold cyan]")
+
+    if agent.context_manager:
+        cm = agent.context_manager
+        pct = cm.usage_fraction
+        col = "green" if pct < 0.70 else ("yellow" if pct < 0.85 else "red")
+        bar = "█" * int(pct * 10) + "░" * (10 - int(pct * 10))
+        seg.append(f"[{col}]ctx [{bar}] {pct:.0%}[/{col}]")
+
+    if agent.session_stats:
+        s = agent.session_stats
+        parts: list[str] = []
+        if s.agents_spawned:
+            parts.append(f"{s.agents_spawned}↓")
+        parts.append(f"{s.tool_calls}⚙")
+        total_tok = s.input_tokens + s.output_tokens
+        if total_tok:
+            parts.append(f"{total_tok:,} tok")
+        seg.append(f"[dim]{' · '.join(parts)}[/dim]")
+
+    if agent.memory_store:
+        n = len(agent.memory_store.all())
+        if n:
+            seg.append(f"[dim]{n}♦ mem[/dim]")
+
+    seg.append(f"[dim]{_uptime_str()}[/dim]")
+    return "  " + "  [dim]│[/dim]  ".join(seg)
+
+
+async def _get_input(agent: Agent, prompt_str: str) -> str:
+    """
+    Print status info + top rule, prompt user, then bottom rule.
+    Both rules are visible — top before typing, bottom immediately after Enter.
+    """
+    console.print(_build_status_line(agent))
+    console.rule(characters="─", style="dim")
+
+    loop = asyncio.get_event_loop()
+    try:
+        line = await loop.run_in_executor(None, lambda: input(prompt_str))
+    except (EOFError, KeyboardInterrupt):
+        raise
+
+    console.rule(characters="─", style="dim")
+    return line
+
+
+# ---------------------------------------------------------------------------
+# Streaming display
 # ---------------------------------------------------------------------------
 
 class _StreamRenderer:
@@ -74,7 +150,6 @@ class _StreamRenderer:
 
     def chunk(self, text: str) -> None:
         self._buf += text
-        # Detect think open/close in accumulated buffer
         while True:
             if not self._in_think:
                 if "<think>" in self._buf:
@@ -85,7 +160,6 @@ class _StreamRenderer:
                     self._in_think = True
                     self._buf = rest
                 else:
-                    # Print everything except a potential partial tag at the end
                     safe = self._buf if "<" not in self._buf else self._buf[:self._buf.rfind("<")]
                     if safe:
                         console.print(safe, end="", highlight=False)
@@ -113,6 +187,91 @@ class _StreamRenderer:
         if self._in_think:
             console.print("[/dim italic]", end="", highlight=False)
             self._in_think = False
+
+
+# ---------------------------------------------------------------------------
+# Thinking indicator — works for both streaming and non-streaming
+# ---------------------------------------------------------------------------
+
+async def _run_with_spinner(coro) -> str:
+    """
+    Non-streaming: 'Thinking… Xs' at the bottom while the model works,
+    then a frozen 'Thought for Xs' header above the printed response.
+    """
+    start = time.monotonic()
+    task = asyncio.ensure_future(coro)
+
+    with Live(console=console, refresh_per_second=8, transient=True) as live:
+        while not task.done():
+            elapsed = time.monotonic() - start
+            live.update(Text.assemble(
+                ("  ◆ Thinking… ", "dim yellow"),
+                (f"{elapsed:.0f}s", "bold dim yellow"),
+            ))
+            await asyncio.sleep(0.12)
+
+    elapsed_thinking = time.monotonic() - start
+    console.print(Text.assemble(
+        ("  ◆ Thought for ", "dim yellow"),
+        (f"{elapsed_thinking:.0f}s", "bold yellow"),
+    ))
+    console.print()
+    return await task
+
+
+async def _run_streaming(agent: Agent, user_input: str) -> str:
+    """
+    Streaming: Live 'Thinking… Xs' until the first token (transient, erases
+    itself), then a frozen '◆ Thought for Xs' header stays visible above the
+    response as it streams normally with no Live context active.
+
+    The Live display is intentionally stopped before any response text prints.
+    Rich's Live refresh cycle overwrites mid-line console.print() output, so
+    keeping Live active during streaming silently swallows the response text.
+    """
+    start = time.monotonic()
+    first_chunk = asyncio.Event()
+    live_unlocked = asyncio.Event()
+    buffered: list[str] = []
+    renderer = _StreamRenderer()
+
+    def on_chunk(text: str) -> None:
+        first_chunk.set()
+        if not live_unlocked.is_set():
+            buffered.append(text)
+        else:
+            renderer.chunk(text)
+
+    agent.on_stream_chunk = on_chunk
+    task = asyncio.ensure_future(agent.run(user_input))
+
+    # Phase 1: Live thinking counter — transient so it erases on exit
+    with Live(console=console, refresh_per_second=8, transient=True) as live:
+        while not first_chunk.is_set() and not task.done():
+            elapsed = time.monotonic() - start
+            live.update(Text.assemble(
+                ("  ◆ Thinking… ", "dim yellow"),
+                (f"{elapsed:.0f}s", "bold dim yellow"),
+            ))
+            await asyncio.sleep(0.12)
+
+    # Live is gone. Freeze elapsed and print a persistent header above response.
+    elapsed_thinking = time.monotonic() - start
+    console.print(Text.assemble(
+        ("  ◆ Thought for ", "dim yellow"),
+        (f"{elapsed_thinking:.0f}s", "bold yellow"),
+    ))
+    console.print()
+
+    # Phase 2: stream with no Live active — output is reliable
+    live_unlocked.set()
+    for chunk in buffered:
+        renderer.chunk(chunk)
+
+    answer = await task
+    renderer.flush()
+    console.print()
+    return answer
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +400,30 @@ async def _run_distill(agent: Agent) -> None:
         console.print("[dim]Nothing new to remember.[/dim]")
 
 
+def _print_footer(agent: Agent, elapsed: float) -> None:
+    """Print the post-response summary line: elapsed · tokens · ctx bar."""
+    elapsed_str = f"{elapsed:.1f}s" if elapsed < 60 else f"{int(elapsed // 60)}m {elapsed % 60:.0f}s"
+    parts: list[str] = [f"elapsed {elapsed_str}"]
+
+    if agent.session_stats:
+        s = agent.session_stats
+        total_tok = s.input_tokens + s.output_tokens
+        if total_tok:
+            parts.append(f"{total_tok:,} tok")
+        if s.cache_hits:
+            parts.append(f"{s.cache_hits} cached")
+
+    if agent.context_manager:
+        cm = agent.context_manager
+        pct = cm.usage_fraction
+        col = "green" if pct < 0.70 else ("yellow" if pct < 0.85 else "red")
+        filled = int(pct * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        parts.append(f"[{col}]ctx [{bar}] {cm.usage_summary}[/{col}]")
+
+    console.print(Text.from_markup("  [dim]" + "  ·  ".join(parts) + "[/dim]"))
+
+
 # ---------------------------------------------------------------------------
 # Command handler
 # ---------------------------------------------------------------------------
@@ -323,7 +506,6 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
     _print_banner(agent)
     _hooks = hooks or []
 
-    # Wrap tool registry with hook execution
     if _hooks:
         orig_execute = agent.registry.execute
 
@@ -336,14 +518,9 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
         agent.registry.execute = hooked_execute  # type: ignore
 
     while True:
+        # ── boxed input: status · top rule · prompt · bottom rule ───────────
         try:
-            prompt = "forge> "
-            if agent.session_stats and agent.session_stats.agents_spawned:
-                s = agent.session_stats
-                prompt = f"forge [{s.agents_spawned}↓ {s.tool_calls}⚙]> "
-            user_input = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: input(prompt)
-            )
+            user_input = await _get_input(agent, "forge> ")
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye.[/dim]")
             break
@@ -353,8 +530,8 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
             continue
 
         if user_input.startswith("/"):
-            parts = user_input.strip().split(None, 1)
-            first = parts[0].lower()
+            parts_split = user_input.strip().split(None, 1)
+            first = parts_split[0].lower()
             if first == "/distill":
                 await _run_distill(agent)
                 continue
@@ -369,40 +546,33 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
                 break
             continue
 
-        console.print()
+        start_time = time.monotonic()
 
-        # Set up streaming renderer for this turn
-        renderer: _StreamRenderer | None = None
-        chunk_fn = None
+        # ── run the agent ────────────────────────────────────────────────────
         if stream:
-            renderer = _StreamRenderer()
-            chunk_fn = renderer.chunk
-            agent.on_stream_chunk = chunk_fn
-
-        try:
-            answer = await agent.run(user_input)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted.[/yellow]")
-            if agent.messages and agent.messages[-1]["role"] == "user":
-                agent.messages.pop()
-            continue
-        finally:
-            agent.on_stream_chunk = None
-
-        if renderer:
-            renderer.flush()
-            console.print()  # newline after streamed text
+            try:
+                await _run_streaming(agent, user_input)
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted.[/yellow]")
+                agent.on_stream_chunk = None
+                if agent.messages and agent.messages[-1]["role"] == "user":
+                    agent.messages.pop()
+                continue
+            finally:
+                agent.on_stream_chunk = None
         else:
+            try:
+                answer = await _run_with_spinner(agent.run(user_input))
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted.[/yellow]")
+                if agent.messages and agent.messages[-1]["role"] == "user":
+                    agent.messages.pop()
+                continue
             console.print()
             console.print(Markdown(answer))
+            console.print()
 
-        # Token bar
-        if agent.context_manager:
-            cm = agent.context_manager
-            pct = cm.usage_fraction
-            filled = int(pct * 20)
-            bar = "█" * filled + "░" * (20 - filled)
-            style = "green" if pct < 0.70 else ("yellow" if pct < 0.85 else "red")
-            console.print(Text(f"  ctx [{bar}] {cm.usage_summary}", style=f"dim {style}"))
-
+        # ── post-response footer ─────────────────────────────────────────────
+        elapsed = time.monotonic() - start_time
+        _print_footer(agent, elapsed)
         console.print()
