@@ -1,12 +1,13 @@
 import asyncio
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
-from rich.spinner import Spinner
 from rich.text import Text
 
 from harness.agent import Agent, SpawnEvent
@@ -45,6 +46,8 @@ _LAST   = "└─"
 _PIPE   = "│ "
 _SPACE  = "  "
 
+_SESSION_START = time.monotonic()
+
 
 def _tree_prefix(depth: int) -> str:
     if depth == 0:
@@ -57,6 +60,56 @@ def _print_banner(agent: Agent) -> None:
     console.print(f"  model   : [bold]{agent.client.model}[/bold]")
     console.print(f"  tools   : [bold]{', '.join(agent.registry.names())}[/bold]")
     console.print(f"  type [bold]/help[/bold] for commands, [bold]Ctrl+D[/bold] to exit\n")
+
+
+# ---------------------------------------------------------------------------
+# Status bar  (printed above the prompt each turn)
+# ---------------------------------------------------------------------------
+
+def _uptime_str() -> str:
+    total = int(time.monotonic() - _SESSION_START)
+    m, s = divmod(total, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def _print_status(agent: Agent) -> None:
+    """Print the status bar above the input prompt."""
+    console.rule(characters="─", style="dim")
+
+    seg: list[str] = []
+    seg.append(f"[bold cyan]{agent.client.model}[/bold cyan]")
+
+    if agent.context_manager:
+        cm = agent.context_manager
+        pct = cm.usage_fraction
+        col = "green" if pct < 0.70 else ("yellow" if pct < 0.85 else "red")
+        bar = "█" * int(pct * 10) + "░" * (10 - int(pct * 10))
+        seg.append(f"[{col}]ctx [{bar}] {pct:.0%}[/{col}]")
+
+    if agent.session_stats:
+        s = agent.session_stats
+        total_tok = s.input_tokens + s.output_tokens
+        parts: list[str] = []
+        if s.agents_spawned:
+            parts.append(f"{s.agents_spawned}↓")
+        parts.append(f"{s.tool_calls}⚙")
+        if total_tok:
+            parts.append(f"{total_tok:,} tok")
+        seg.append(f"[dim]{' · '.join(parts)}[/dim]")
+
+    if agent.memory_store:
+        n = len(agent.memory_store.all())
+        if n:
+            seg.append(f"[dim]{n}♦ mem[/dim]")
+
+    seg.append(f"[dim]{_uptime_str()}[/dim]")
+
+    console.print("  " + "  [dim]│[/dim]  ".join(seg))
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +127,6 @@ class _StreamRenderer:
 
     def chunk(self, text: str) -> None:
         self._buf += text
-        # Detect think open/close in accumulated buffer
         while True:
             if not self._in_think:
                 if "<think>" in self._buf:
@@ -85,7 +137,6 @@ class _StreamRenderer:
                     self._in_think = True
                     self._buf = rest
                 else:
-                    # Print everything except a potential partial tag at the end
                     safe = self._buf if "<" not in self._buf else self._buf[:self._buf.rfind("<")]
                     if safe:
                         console.print(safe, end="", highlight=False)
@@ -113,6 +164,29 @@ class _StreamRenderer:
         if self._in_think:
             console.print("[/dim italic]", end="", highlight=False)
             self._in_think = False
+
+
+# ---------------------------------------------------------------------------
+# Thinking indicator
+# ---------------------------------------------------------------------------
+
+async def _run_with_spinner(coro) -> str:
+    """
+    Run a coroutine while showing a live elapsed-time spinner.
+    Used in non-streaming mode so the user knows the model is working.
+    The live display is transient — erased before the response is printed.
+    """
+    start = time.monotonic()
+    task = asyncio.ensure_future(coro)
+
+    with Live(console=console, refresh_per_second=8, transient=True) as live:
+        while not task.done():
+            elapsed = time.monotonic() - start
+            live.update(Text.assemble(("  ◆ thinking for ", "dim yellow"),
+                                      (f"{elapsed:.0f}s…", "bold dim yellow")))
+            await asyncio.sleep(0.12)
+
+    return await task
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +396,7 @@ def _handle_command(raw: str, agent: Agent) -> bool:
 async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = None) -> None:
     _print_banner(agent)
     _hooks = hooks or []
+    turn = 0
 
     # Wrap tool registry with hook execution
     if _hooks:
@@ -336,13 +411,14 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
         agent.registry.execute = hooked_execute  # type: ignore
 
     while True:
+        # ── status bar above the input ──────────────────────────────────────
+        _print_status(agent)
+
+        # ── prompt ──────────────────────────────────────────────────────────
         try:
-            prompt = "forge> "
-            if agent.session_stats and agent.session_stats.agents_spawned:
-                s = agent.session_stats
-                prompt = f"forge [{s.agents_spawned}↓ {s.tool_calls}⚙]> "
+            prompt_str = f"forge [t{turn}]> "
             user_input = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: input(prompt)
+                None, lambda: input(prompt_str)
             )
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye.[/dim]")
@@ -369,40 +445,59 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
                 break
             continue
 
+        turn += 1
+        start_time = time.monotonic()
         console.print()
 
-        # Set up streaming renderer for this turn
-        renderer: _StreamRenderer | None = None
-        chunk_fn = None
+        # ── run the agent ────────────────────────────────────────────────────
         if stream:
+            # Show a dim header so the user knows generation started
+            console.print(f"  [dim]◆  {agent.client.model}[/dim]\n", highlight=False)
             renderer = _StreamRenderer()
-            chunk_fn = renderer.chunk
-            agent.on_stream_chunk = chunk_fn
-
-        try:
-            answer = await agent.run(user_input)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted.[/yellow]")
-            if agent.messages and agent.messages[-1]["role"] == "user":
-                agent.messages.pop()
-            continue
-        finally:
-            agent.on_stream_chunk = None
-
-        if renderer:
+            agent.on_stream_chunk = renderer.chunk
+            try:
+                answer = await agent.run(user_input)
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted.[/yellow]")
+                if agent.messages and agent.messages[-1]["role"] == "user":
+                    agent.messages.pop()
+                continue
+            finally:
+                agent.on_stream_chunk = None
             renderer.flush()
-            console.print()  # newline after streamed text
+            console.print()
         else:
+            agent.on_stream_chunk = None
+            try:
+                answer = await _run_with_spinner(agent.run(user_input))
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted.[/yellow]")
+                if agent.messages and agent.messages[-1]["role"] == "user":
+                    agent.messages.pop()
+                continue
             console.print()
             console.print(Markdown(answer))
 
-        # Token bar
+        # ── post-response info ───────────────────────────────────────────────
+        elapsed = time.monotonic() - start_time
+        elapsed_str = f"{elapsed:.1f}s" if elapsed < 60 else f"{int(elapsed//60)}m {elapsed%60:.0f}s"
+
+        info_parts = [f"elapsed {elapsed_str}"]
+        if agent.session_stats:
+            s = agent.session_stats
+            total_tok = s.input_tokens + s.output_tokens
+            if total_tok:
+                info_parts.append(f"{total_tok:,} tok total")
+            if s.cache_hits:
+                info_parts.append(f"{s.cache_hits} cached")
+
         if agent.context_manager:
             cm = agent.context_manager
             pct = cm.usage_fraction
+            col = "green" if pct < 0.70 else ("yellow" if pct < 0.85 else "red")
             filled = int(pct * 20)
             bar = "█" * filled + "░" * (20 - filled)
-            style = "green" if pct < 0.70 else ("yellow" if pct < 0.85 else "red")
-            console.print(Text(f"  ctx [{bar}] {cm.usage_summary}", style=f"dim {style}"))
+            info_parts.append(f"[{col}]ctx [{bar}] {cm.usage_summary}[/{col}]")
 
+        console.print(Text.from_markup("  [dim]" + "  ·  ".join(info_parts) + "[/dim]"))
         console.print()
