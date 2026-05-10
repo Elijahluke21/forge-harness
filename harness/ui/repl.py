@@ -1,6 +1,7 @@
 import asyncio
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -66,10 +67,10 @@ def _print_banner(agent: Agent) -> None:
 # Input box layout
 #
 #   [status info line]
-#   ─────────────────────────────────   ← top rule  (visual separator)
-#   forge [t3]> user types here
-#   ─────────────────────────────────   ← bottom rule (printed after Enter)
-#   ◆ Thinking… 4s                      ← live counter until first token
+#   ─────────────────────────────────   ← top rule
+#   forge> user types here              ← prompt (cursor here while typing)
+#   ─────────────────────────────────   ← bottom rule (visible while typing)
+#   ◆ Thinking… 4s → ◆ Thought for 4s  ← persists above the response
 #   response streams here…
 #   [footer: elapsed · tokens · ctx]
 # ---------------------------------------------------------------------------
@@ -85,8 +86,8 @@ def _uptime_str() -> str:
     return f"{s}s"
 
 
-def _print_input_top(agent: Agent) -> None:
-    """Print the status info + top separator rule above the input prompt."""
+def _build_status_line(agent: Agent) -> str:
+    """Return the status info markup string (no newline)."""
     seg: list[str] = []
     seg.append(f"[bold cyan]{agent.client.model}[/bold cyan]")
 
@@ -114,14 +115,45 @@ def _print_input_top(agent: Agent) -> None:
             seg.append(f"[dim]{n}♦ mem[/dim]")
 
     seg.append(f"[dim]{_uptime_str()}[/dim]")
+    return "  " + "  [dim]│[/dim]  ".join(seg)
 
-    console.print("  " + "  [dim]│[/dim]  ".join(seg))
+
+async def _get_input(agent: Agent, prompt_str: str) -> str:
+    """
+    Read user input with both separator rules visible while typing.
+
+    Prints the status info, top rule, prompt line, and bottom rule —
+    then uses ANSI cursor-up to reposition the cursor on the prompt line
+    so the bottom rule is already visible below before the user types.
+    After Enter, advances past the bottom rule so subsequent output is clean.
+    """
+    width = console.width
+    rule_plain = "─" * width
+
+    # Status + top rule via Rich (handles markup / colour resets cleanly)
+    console.print(_build_status_line(agent))
     console.rule(characters="─", style="dim")
 
+    # Print the prompt text, a newline, then the bottom rule, then a newline.
+    # This puts cursor at the start of a blank line below the bottom rule.
+    sys.stdout.write(prompt_str + "\n")
+    sys.stdout.write("\x1b[2m" + rule_plain + "\x1b[0m\n")
 
-def _print_input_bottom() -> None:
-    """Print the bottom separator rule immediately after the user presses Enter."""
-    console.rule(characters="─", style="dim")
+    # Move cursor back up 2 lines and right to end of prompt text,
+    # so input() echoes on the prompt line with the bottom rule below.
+    sys.stdout.write(f"\x1b[2A\x1b[{len(prompt_str)}C")
+    sys.stdout.flush()
+
+    loop = asyncio.get_event_loop()
+    try:
+        line = await loop.run_in_executor(None, lambda: input(""))
+    except (EOFError, KeyboardInterrupt):
+        raise
+
+    # After Enter the cursor sits on the bottom rule line — skip past it.
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return line
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +216,8 @@ class _StreamRenderer:
 
 async def _run_with_spinner(coro) -> str:
     """
-    Non-streaming: run the coroutine while showing a live 'Thinking… Xs'
-    counter. The Live display is transient — erased before the response prints.
+    Non-streaming: live 'Thinking… Xs' counter while the model works,
+    then a frozen 'Thought for Xs' header above the printed response.
     """
     start = time.monotonic()
     task = asyncio.ensure_future(coro)
@@ -199,6 +231,12 @@ async def _run_with_spinner(coro) -> str:
             ))
             await asyncio.sleep(0.12)
 
+    elapsed_thinking = time.monotonic() - start
+    console.print(Text.assemble(
+        ("  ◆ Thought for ", "dim yellow"),
+        (f"{elapsed_thinking:.0f}s", "bold yellow"),
+    ))
+    console.print()
     return await task
 
 
@@ -227,7 +265,7 @@ async def _run_streaming(agent: Agent, user_input: str) -> str:
     agent.on_stream_chunk = on_chunk
     task = asyncio.ensure_future(agent.run(user_input))
 
-    # Show thinking counter until first token or task finishes
+    # Live "Thinking…" counter until first token arrives (transient → erased on exit)
     with Live(console=console, refresh_per_second=8, transient=True) as live:
         while not first_chunk_event.is_set() and not task.done():
             elapsed = time.monotonic() - start
@@ -236,12 +274,18 @@ async def _run_streaming(agent: Agent, user_input: str) -> str:
                 (f"{elapsed:.0f}s", "bold dim yellow"),
             ))
             await asyncio.sleep(0.12)
-    # Live display is now erased from the terminal
 
-    # Signal that subsequent on_chunk calls go directly to the renderer
+    # Freeze elapsed time, print a persistent "Thought for Xs" header.
+    # This stays visible above the response while it streams.
+    elapsed_thinking = time.monotonic() - start
+    console.print(Text.assemble(
+        ("  ◆ Thought for ", "dim yellow"),
+        (f"{elapsed_thinking:.0f}s", "bold yellow"),
+    ))
+    console.print()
+
+    # Unlock direct rendering and flush chunks buffered during the Live window
     live_done.set()
-
-    # Flush anything buffered during the Live window
     for chunk in buffered:
         renderer.chunk(chunk)
 
@@ -483,7 +527,6 @@ def _handle_command(raw: str, agent: Agent) -> bool:
 async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = None) -> None:
     _print_banner(agent)
     _hooks = hooks or []
-    turn = 0
 
     if _hooks:
         orig_execute = agent.registry.execute
@@ -497,19 +540,12 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
         agent.registry.execute = hooked_execute  # type: ignore
 
     while True:
-        # ── input box: status info + top rule + prompt + bottom rule ────────
-        _print_input_top(agent)
-
+        # ── boxed input: status · top rule · prompt · bottom rule ───────────
         try:
-            prompt_str = f"forge [t{turn}]> "
-            user_input = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: input(prompt_str)
-            )
+            user_input = await _get_input(agent, "forge> ")
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye.[/dim]")
             break
-
-        _print_input_bottom()
 
         user_input = user_input.strip()
         if not user_input:
@@ -532,7 +568,6 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
                 break
             continue
 
-        turn += 1
         start_time = time.monotonic()
 
         # ── run the agent ────────────────────────────────────────────────────
