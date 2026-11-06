@@ -1,6 +1,8 @@
 import asyncio
 import os
 import signal
+import subprocess
+import sys
 
 from harness.tools.registry import ToolRegistry
 from harness.tools.workspace import Workspace
@@ -22,12 +24,16 @@ async def run_shell(
     On timeout the whole group is killed — `proc.kill()` alone only kills the
     shell and leaves compilers/test runners it started running in the background.
     """
+    group = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if sys.platform == "win32" else {"start_new_session": True}
+    )
     proc = await asyncio.create_subprocess_shell(
         command,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        start_new_session=True,
+        **group,
     )
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -44,6 +50,11 @@ async def run_shell(
 
 
 def _kill_group(proc: asyncio.subprocess.Process) -> None:
+    if sys.platform == "win32":
+        # No process groups/killpg on Windows: taskkill /T kills the whole tree.
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
