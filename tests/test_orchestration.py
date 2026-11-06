@@ -312,7 +312,7 @@ async def test_autopilot_bad_plan_counts_as_no_progress(tmp_path):
 async def test_on_finish_notification(tmp_path):
     out = tmp_path / "notified.txt"
     f = forge_with(builder_handler, tmp_path)
-    cfg = AutopilotConfig(on_finish=f'echo "$FORGE_STATUS|$FORGE_SUMMARY" > {out}')
+    cfg = AutopilotConfig(on_finish=f'echo "$FORGE_STATUS|$FORGE_SUMMARY" > {out.as_posix()}')
     await Autopilot(f.orchestrator, f.worker_registry, [Check("done", "test -f done.txt")],
                     f.workspace.cwd, cfg).run("x")
     assert out.read_text().startswith("done|done: all 1 checks pass")
