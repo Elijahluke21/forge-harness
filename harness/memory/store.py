@@ -1,4 +1,7 @@
 import json
+import os
+import re
+import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -71,14 +74,44 @@ class MemoryStore:
     # Prompt injection
     # ------------------------------------------------------------------
 
-    def format_for_prompt(self) -> str:
-        entries = self.all()
+    def relevant(self, query: str = "", limit: int = 8) -> list[MemoryEntry]:
+        """
+        Entries tagged "pinned" first, then entries ranked by word overlap with
+        `query`, most recently updated breaking ties. No query = most recent.
+        """
+        pinned = [e for e in self.all() if "pinned" in e.tags]
+        rest = [e for e in self.all() if "pinned" not in e.tags]
+        words = _words(query)
+        if words:
+            scored = []
+            for e in rest:
+                hits = len(words & _words(f"{e.key} {e.content} {' '.join(e.tags)}"))
+                if hits:
+                    scored.append((hits, e.updated, e))
+            scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+            rest = [e for _, _, e in scored]
+        return (pinned + rest)[:limit]
+
+    def format_for_prompt(self, query: str = "", limit: int = 8, max_chars: int = 2_000) -> str:
+        """
+        A bounded memory block for a system prompt. Dumping every entry into
+        every agent's prompt grows without limit and crowds out the task on a
+        small context window, so only the most relevant entries are included.
+        """
+        entries = self.relevant(query, limit)
         if not entries:
             return ""
-        lines = ["## Forge Memory (persistent facts from previous sessions)"]
+        lines = ["## Forge Memory (relevant facts from previous sessions)"]
+        used = len(lines[0])
         for e in entries:
             tag_str = f" [{', '.join(e.tags)}]" if e.tags else ""
-            lines.append(f"- [{e.key}]{tag_str}: {e.content}")
+            line = f"- [{e.key}]{tag_str}: {e.content}"
+            if used + len(line) > max_chars:
+                break
+            lines.append(line)
+            used += len(line)
+        if len(self) > len(lines) - 1:
+            lines.append(f"({len(self)} memories total — use memory_search for others)")
         return "\n".join(lines)
 
     def __len__(self) -> int:
@@ -90,10 +123,19 @@ class MemoryStore:
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps([asdict(e) for e in self._entries.values()], indent=2),
-            encoding="utf-8",
-        )
+        data = json.dumps([asdict(e) for e in self._entries.values()], indent=2)
+        # Atomic replace: a crash mid-write must not corrupt the whole store.
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".memory-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -104,8 +146,18 @@ class MemoryStore:
                 e = MemoryEntry(**item)
                 self._entries[e.key] = e
         except (json.JSONDecodeError, TypeError):
-            pass  # corrupt file — start fresh
+            # Keep the corrupt file for inspection instead of overwriting it
+            # on the next save.
+            backup = self.path.with_suffix(".corrupt.json")
+            self.path.replace(backup)
 
 
 def _slugify(key: str) -> str:
     return key.lower().strip().replace(" ", "_")
+
+
+_STOP = frozenset("a an the and or of to in on for with is are be this that it as at by from".split())
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower().replace("_", " ")) if w not in _STOP and len(w) > 1}

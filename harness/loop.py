@@ -1,12 +1,38 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from harness.client import DEFAULT_MAX_TOKENS, BaseClient, TextChunkFn
+from harness.client import DEFAULT_MAX_TOKENS, BaseClient, TextChunkFn, ToolCall
+from harness.text import strip_think
 from harness.tools.registry import ToolRegistry
 
 DEFAULT_MAX_ITERATIONS = 20
 
+# Returned when an agent runs out of iterations. Deliberately NOT "[error]":
+# an agent that ran out of turns should be reported, not blindly retried with
+# the same budget (which just doubles the cost of a task that is too big).
+INCOMPLETE_PREFIX = "[incomplete]"
+
 ToolCallback = Callable[[str, dict, str], Awaitable[None] | None]
+
+
+async def _execute_all(registry: ToolRegistry, calls: list[ToolCall]) -> list[str]:
+    """
+    Run tool calls in parallel. If one raises (a budget abort, or the run being
+    cancelled), cancel the others instead of leaving them running unattended.
+    """
+    async def one(tc: ToolCall) -> str:
+        if tc.error:
+            return f"[error] could not run '{tc.name}': {tc.error}"
+        return await registry.execute(tc.name, tc.input)
+
+    tasks = [asyncio.create_task(one(tc)) for tc in calls]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def run(
@@ -23,11 +49,16 @@ async def run(
 ) -> str:
     """
     Run the agentic loop until the model stops requesting tool calls.
-    Mutates `messages` in place. Returns the final text response.
+    Mutates `messages` in place. Returns the final text response with any
+    <think> blocks removed.
+
+    Raises BudgetExceeded (via session_stats.check_budget) when the shared run
+    budget is spent — callers that want a string should catch HarnessAbort.
     """
-    for iteration in range(max_iterations):
-        # Only stream on the final response turn (no tool calls pending).
-        # For intermediate turns we use regular send so tool calls process cleanly.
+    for _ in range(max_iterations):
+        if session_stats:
+            session_stats.check_budget()
+
         response = await client.send(
             messages=messages,
             system=system,
@@ -36,20 +67,22 @@ async def run(
             on_text_chunk=on_stream_chunk if on_stream_chunk else None,
         )
 
-        # Track token usage
         if context_manager:
             context_manager.record(response)
         if session_stats:
             session_stats.record_tokens(response.input_tokens, response.output_tokens)
 
-        if not response.has_tool_calls:
-            messages.append({"role": "assistant", "content": response.text})
-            return response.text
+        # Reasoning text is useful while generating, but re-sending it on every
+        # later turn burns context for nothing — keep only the visible answer.
+        visible = strip_think(response.text)
 
-        # Append assistant turn (text + tool_use blocks)
+        if not response.has_tool_calls:
+            messages.append({"role": "assistant", "content": visible})
+            return visible
+
         assistant_content: list[dict] = []
-        if response.text:
-            assistant_content.append({"type": "text", "text": response.text})
+        if visible:
+            assistant_content.append({"type": "text", "text": visible})
         for tc in response.tool_calls:
             assistant_content.append({
                 "type": "tool_use",
@@ -59,24 +92,17 @@ async def run(
             })
         messages.append({"role": "assistant", "content": assistant_content})
 
-        # Execute all tool calls in parallel
-        results: list[str] = list(await asyncio.gather(*[
-            registry.execute(tc.name, tc.input)
-            for tc in response.tool_calls
-        ]))
+        results = await _execute_all(registry, response.tool_calls)
 
-        # Offload large results before they enter the context
         if context_manager:
             results = [context_manager.offload_if_large(r) for r in results]
 
-        # Fire callbacks
         if on_tool_call:
             for tc, result in zip(response.tool_calls, results):
                 ret = on_tool_call(tc.name, tc.input, result)
                 if asyncio.iscoroutine(ret):
                     await ret
 
-        # Append tool results
         messages.append({
             "role": "user",
             "content": [
@@ -85,14 +111,11 @@ async def run(
             ],
         })
 
-        # Compact if context budget is running low
         if context_manager:
             status = await context_manager.maybe_compact(messages, client, system)
-            if status:
-                # Surface compaction event through the tool callback channel
-                if on_tool_call:
-                    ret = on_tool_call("__compact__", {}, status)
-                    if asyncio.iscoroutine(ret):
-                        await ret
+            if status and on_tool_call:
+                ret = on_tool_call("__compact__", {}, status)
+                if asyncio.iscoroutine(ret):
+                    await ret
 
-    return "[error] max_iterations reached without a final response"
+    return f"{INCOMPLETE_PREFIX} stopped after {max_iterations} iterations without a final answer"

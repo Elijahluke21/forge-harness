@@ -111,6 +111,65 @@ Goal: Production-quality UX and configurability.
 
 ---
 
+## Phase 7 — Autonomy
+Goal: Give it a goal and walk away. The run ends when code says it is done,
+not when the model feels done, and it can never run forever.
+
+- [x] 7.1  Run budget — one shared ceiling (tokens, spawns, tool calls, minutes) for the whole agent tree; BudgetExceeded unwinds the run and cancels in-flight work
+- [x] 7.2  Acceptance checks — checks.yaml of commands; done = every one exits 0; loaded once so agents can't redefine "done" mid-run
+- [x] 7.3  Code-driven plan executor — validated step graph (ids, roles, deps, cycles), parallel where independent, failures skip downstream steps, dependents get summaries + file paths instead of raw output
+- [x] 7.4  Progress watchdog — no new passing check for N rounds → escalate planning to a stronger model once → stop with blocked.md
+- [x] 7.5  `forge run "goal" --checks checks.yaml` — run folder with task.md, events.jsonl, per-round plans and step outputs, result.md/blocked.md; on_finish hook for phone/watch notifications
+- [ ] 7.6  Real isolation — run each job in a container or separate OS user, plus a git worktree per run (workspace confinement today is a guard, not a sandbox)
+- [ ] 7.7  Ship tool — trigger a fastlane lane in CI (keys stay in the CI secret store; agents never see them)
+- [ ] 7.8  App templates — starter projects (SwiftUI + Supabase, fastlane, test targets, checks.yaml) so agents fill in features instead of inventing structure
+
+## Review fixes (v0.2.0)
+- ResultCache returned stale results after changes ("run the tests" stayed cached after a fix): only read-only roles are cached now, and any mutating tool call invalidates the cache
+- Compaction could orphan a tool_use from its tool_result (API rejects the history); cut points now respect tool pairing and roles keep alternating
+- Every memory entry was injected into every agent's prompt; now relevance-ranked, pinned-first, size-capped
+- Sub-agents could write persistent memory (prompt-injection persistence); workers now get read-only memory
+- Role-scoped sub-agents lost require_confirm (fresh registry); permissions and hooks now carry over
+- Hooks replaced the whole environment (no PATH, so hook commands failed silently) and only ran for the orchestrator; now registry-level, async, env merged
+- bash: 30s timeout killed builds and left child processes running; now process-group kill, configurable timeout up to 30 min, head+tail truncation
+- Malformed tool-call JSON from local models crashed the run (non-streaming) or silently became `{}` (streaming); now reported back to the model as an error
+- Anthropic client kept only the last text block of a response
+- Qwen <think> blocks broke plan/distill JSON parsing and were re-sent in history every turn; now stripped
+- Hitting max_iterations returned "[error]" and triggered a full retry with the same budget; now "[incomplete]", not retried
+- Empty MemoryStore was falsy (`__len__`), so /memory and /distill said "no memory store" and distillation never ran on a fresh install
+- /help ate "[path]" and "[md|json]" as Rich markup
+- max_depth config was ignored; children ignored context_window config; unknown role names silently fell back to defaults
+- New edit_file tool (exact snippet replace) — small models do far better than rewriting whole files
+- main.py and cli.py duplicated all wiring; both now use harness/app.py
+- Unknown config keys are reported instead of silently ignored
+
+---
+
+## Running unattended
+
+```bash
+pip install -e ".[dev]"
+forge run "Add a settings screen with a dark-mode toggle" --checks checks.yaml --workspace ~/projects/my-app
+```
+
+`checks.yaml`:
+
+```yaml
+checks:
+  - id: builds
+    cmd: xcodebuild -scheme MyApp -destination 'generic/platform=iOS Simulator' build
+    timeout: 900
+    description: The app compiles
+  - id: tests
+    cmd: xcodebuild test -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16'
+    timeout: 1200
+```
+
+Exit code is 0 only when every check passes. Read `.forge/runs/<timestamp>/` for what happened.
+Keep the tests the checks run somewhere agents can't quietly edit (a separate test target you own, or a read-only path) — otherwise "make the tests pass" can be satisfied by changing the tests.
+
+---
+
 ## Deferred / Future
 - Vector DB for semantic memory retrieval
 - Web search tool
@@ -123,27 +182,29 @@ Goal: Production-quality UX and configurability.
 ## File Structure
 
 ```
-forge_harness/
+forge-harness/
 ├── harness/
-│   ├── client.py           # Anthropic API wrapper
+│   ├── app.py              # Builds orchestrator + registries from config
+│   ├── cli.py              # `forge` (REPL) and `forge run` (autopilot)
+│   ├── client.py           # Anthropic + Ollama clients, normalized Response
 │   ├── loop.py             # Agentic loop
-│   ├── agent.py            # Agent class (orchestrator + sub-agent share this)
-│   ├── tools/
-│   │   ├── registry.py     # Tool registry
-│   │   ├── bash.py
-│   │   ├── files.py
-│   │   └── spawn_agent.py  # The sub-agent spawner tool
-│   ├── context/
-│   │   ├── manager.py      # Context window tracking + compaction
-│   │   ├── summarizer.py   # Summarization strategies
-│   │   └── checkpoint.py   # Save/load conversation state
-│   ├── memory/
-│   │   ├── session.py      # In-session memory
-│   │   └── persistent.py   # Cross-session file memory
-│   └── ui/
-│       └── repl.py         # Terminal REPL
+│   ├── agent.py            # Agent class + spawn_subagent / spawn_agent tool
+│   ├── roles.py            # Role presets
+│   ├── planning.py         # plan_task tool + generate_plan
+│   ├── executor.py         # Plan validation + dependency-graph execution
+│   ├── checks.py           # Acceptance checks
+│   ├── autopilot.py        # Unattended run loop + watchdog
+│   ├── budget.py           # RunBudget / BudgetExceeded
+│   ├── session.py          # SessionStats, ResultCache
+│   ├── text.py             # think-stripping, JSON extraction
+│   ├── config.py
+│   ├── prompt.py
+│   ├── tools/              # registry, bash, files (+ edit_file), workspace
+│   ├── context/            # manager (offload + compaction), checkpoint
+│   ├── memory/             # store, tools, distill
+│   └── ui/repl.py
+├── tests/                  # pytest suite with a scripted fake model
 ├── main.py
 ├── config.yaml
-├── pyproject.toml
-└── PLAN.md                 # This file
+└── PLAN.md
 ```
