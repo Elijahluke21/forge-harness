@@ -1,9 +1,11 @@
 # Forge harness configuration
 # Copy to ~/.forge/config.yaml for global settings,
 # or keep as .forge.yaml in a project directory for project-local settings.
+# Unknown keys are reported at startup.
 
 backend: ollama
 model: qwen3.6:27b
+# base_url: http://localhost:11434/v1
 max_tokens: 8096
 context_window: 32768
 compact_at: 0.80
@@ -15,18 +17,43 @@ max_iterations: 20
 
 memory_path: ~/.forge/memory.json
 
-# Tools that require explicit user confirmation before running.
-# Uncomment to enable:
+# Confine file tools to one directory (bash also starts there).
+# workspace: ~/projects/my-app
+
+# Run budget — one ceiling for the whole agent tree. 0 or omitted = unlimited.
+# Strongly recommended for `forge run`.
+budget:
+  max_tokens: 2000000
+  max_spawns: 200
+  max_tool_calls: 1500
+  max_minutes: 180
+
+# Autopilot (`forge run "goal" --checks checks.yaml`)
+autopilot:
+  max_rounds: 8        # plan → execute cycles
+  stall_rounds: 3      # rounds with no new passing check before stopping
+  max_parallel: 3      # steps running at once within a round
+  # Runs at the end with FORGE_STATUS, FORGE_RUN_DIR, FORGE_SUMMARY set.
+  # e.g. push to your phone/watch via ntfy:
+  # on_finish: curl -s -d "$FORGE_SUMMARY" ntfy.sh/your-private-topic
+
+# When the run stalls, re-plan once with a stronger model before giving up.
+# escalation:
+#   backend: anthropic
+#   model: claude-sonnet-4-6
+
+# Tools that require explicit user confirmation before running (REPL only —
+# an unattended run has nobody to answer).
 # permissions:
 #   require_confirm:
 #     - write_file
 #     - bash
 
-# Shell hooks run around tool calls.
+# Shell hooks run around tool calls (orchestrator and sub-agents).
 # hooks:
 #   - on: pre
 #     tool: bash
 #     cmd: echo "[hook] about to run bash"
 #   - on: post
 #     tool: "*"
-#     cmd: echo "[hook] tool finished"
+#     cmd: echo "[hook] $FORGE_TOOL finished: $FORGE_RESULT_STATUS"

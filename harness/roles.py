@@ -22,7 +22,7 @@ ROLES: dict[str, Role] = {
             "into a numbered list of clear, self-contained sub-tasks. "
             "Output ONLY the list — no preamble, no explanation."
         ),
-        tools=None,
+        tools=[],   # planning needs no tools; give it none so it cannot start doing the work
     ),
     "reader": Role(
         name="reader",
@@ -39,15 +39,16 @@ ROLES: dict[str, Role] = {
             "capture output, and report results precisely. "
             "If a command fails, report the error verbatim."
         ),
-        tools=["bash", "read_file", "write_file"],
+        tools=["bash", "read_file", "write_file", "edit_file"],
     ),
     "writer": Role(
         name="writer",
         system=(
             "You are a file-writing sub-agent. Write or modify files as instructed. "
+            "Prefer edit_file for changes to existing files. "
             "Confirm each file written with its path and byte count."
         ),
-        tools=["read_file", "write_file"],
+        tools=["read_file", "write_file", "edit_file"],
     ),
     "synthesizer": Role(
         name="synthesizer",
@@ -71,3 +72,8 @@ ROLES: dict[str, Role] = {
 
 def get_role(name: str) -> Role | None:
     return ROLES.get(name.lower())
+
+
+# Roles whose results depend only on their inputs and the (unchanged) workspace.
+# Only these are cached; anything that runs commands must re-run every time.
+CACHEABLE_ROLES = frozenset({"planner", "reader", "synthesizer"})

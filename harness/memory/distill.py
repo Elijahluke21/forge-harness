@@ -4,12 +4,11 @@ and write them into the memory store.
 
 Called:
   - manually via /distill
-  - automatically when context compaction fires
   - at session end
 """
 from harness.client import BaseClient
-from harness.context.manager import ContextManager
 from harness.memory.store import MemoryStore
+from harness.text import extract_json, strip_think
 
 
 async def distill(
@@ -29,12 +28,12 @@ async def distill(
     for msg in messages:
         role = msg["role"]
         content = msg.get("content", "")
-        if isinstance(content, str) and content.strip():
-            lines.append(f"{role.upper()}: {content[:600]}")
+        if isinstance(content, str) and strip_think(content):
+            lines.append(f"{role.upper()}: {strip_think(content)[:600]}")
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    text = block["text"].strip()
+                    text = strip_think(block["text"])
                     if text:
                         lines.append(f"{role.upper()}: {text[:600]}")
 
@@ -59,26 +58,22 @@ If nothing is worth remembering, output: []
         max_tokens=600,
     )
 
-    # Parse the JSON response
-    text = resp.text.strip()
-    # Strip markdown code fences if present
-    if text.startswith("```"):
-        text = "\n".join(text.split("\n")[1:])
-        text = text.rstrip("`").strip()
-
     try:
-        import json
-        items = json.loads(text)
-        if not isinstance(items, list):
-            return []
-    except (json.JSONDecodeError, ValueError):
+        items = extract_json(resp.text)
+    except ValueError:
+        return []
+    if not isinstance(items, list):
         return []
 
     written = []
     for item in items:
-        key = item.get("key", "").strip()
-        content = item.get("content", "").strip()
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key", "")).strip()
+        content = str(item.get("content", "")).strip()
         tags = item.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
         if key and content:
             store.set(key, content, tags)
             written.append(key)

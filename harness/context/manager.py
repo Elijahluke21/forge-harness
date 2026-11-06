@@ -1,12 +1,17 @@
+import hashlib
 import json
 import tempfile
 from pathlib import Path
 
 from harness.client import BaseClient, Response
+from harness.text import strip_think
 
 # Default context windows
+# These are what the harness budgets for, not each model's maximum: a local
+# 27B model's usable window is limited by VRAM for the KV cache.
 CONTEXT_WINDOWS = {
     "qwen3.6:27b": 32_768,
+    "qwen3.8:27b": 32_768,
     "claude-sonnet-4-6": 200_000,
     "claude-opus-4-7": 200_000,
     "claude-haiku-4-5": 200_000,
@@ -34,8 +39,10 @@ class ContextManager:
         compact_at: float = COMPACT_AT,
         offload_chars: int = OFFLOAD_CHARS,
         budget_fraction: float = 1.0,
+        offload_dir: str | Path | None = None,
     ):
         base_window = context_window or CONTEXT_WINDOWS.get(model, CONTEXT_WINDOWS["default"])
+        self.base_window = base_window
         self.context_window = int(base_window * budget_fraction)
         self.compact_at = compact_at
         self.offload_chars = offload_chars
@@ -45,7 +52,14 @@ class ContextManager:
         self.total_output_tokens: int = 0
         self.compactions: int = 0
 
-        self._offload_dir = Path(tempfile.mkdtemp(prefix="forge_ctx_"))
+        # Offloaded results must live somewhere read_file is allowed to reach;
+        # with a confined workspace, pass a directory inside it.
+        if offload_dir:
+            self._offload_dir = Path(offload_dir)
+            self._offload_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._offload_dir = Path(tempfile.mkdtemp(prefix="forge_ctx_"))
+        self.offload_dir = self._offload_dir
 
     # ------------------------------------------------------------------
     # Token tracking
@@ -83,7 +97,7 @@ class ContextManager:
         if len(content) <= self.offload_chars:
             return content
 
-        fname = f"result_{abs(hash(content)) % 10 ** 9:09x}.txt"
+        fname = f"result_{hashlib.md5(content.encode()).hexdigest()[:12]}.txt"
         path = self._offload_dir / fname
         path.write_text(content, encoding="utf-8")
 
@@ -117,39 +131,52 @@ class ContextManager:
     async def _compact(self, messages: list[dict], client: BaseClient) -> str:
         """
         Summarize the middle of the message history.
-        Keeps the first 2 messages (establishes task context) and
-        the last 6 (immediate working context), summarizes everything between.
+
+        Keeps the first message (the task) and a tail of recent turns, and
+        folds a summary of everything between into the first message.
+
+        The cut points must respect tool pairing: every assistant `tool_use`
+        needs its `tool_result` in the very next user message, or the API
+        rejects the history. So the tail always starts on an assistant turn,
+        and the summary is merged into the first user message rather than
+        inserted as a second consecutive user message.
         """
         if len(messages) <= 8:
             return "context high but history too short to compact"
 
-        head = messages[:2]
-        tail = messages[-6:]
-        mid  = messages[2:-6]
+        first = messages[0]
+        tail_start = max(1, len(messages) - 6)
+        while tail_start < len(messages) and messages[tail_start]["role"] != "assistant":
+            tail_start += 1
+        if tail_start >= len(messages) - 1 or tail_start <= 1:
+            return "context high but no safe point to compact"
 
-        transcript = self._messages_to_transcript(mid)
+        mid = messages[1:tail_start]
+        tail = messages[tail_start:]
 
         resp = await client.send(
-            messages=[{"role": "user", "content": transcript}],
+            messages=[{"role": "user", "content": self._messages_to_transcript(mid)}],
             system=(
                 "Summarize this conversation segment precisely. "
                 "Preserve: all files created/modified (with paths), commands run, "
-                "command outputs, decisions made, and any facts established. "
+                "command outputs that matter, decisions made, and any facts established. "
                 "Be concise. Output the summary only — no preamble."
             ),
             max_tokens=700,
         )
+        summary = strip_think(resp.text) or "(summary unavailable)"
 
-        summary_block: dict = {
-            "role": "user",
-            "content": (
-                f"[Context compacted — {len(mid)} messages → 1 summary]\n\n"
-                f"{resp.text}"
-            ),
-        }
+        note = f"[Context compacted — {len(mid)} earlier messages summarized]\n\n{summary}"
+        if isinstance(first.get("content"), str):
+            new_first = {"role": "user", "content": f"{first['content']}\n\n{note}"}
+        else:
+            new_first = {
+                "role": "user",
+                "content": list(first["content"]) + [{"type": "text", "text": note}],
+            }
 
         messages.clear()
-        messages.extend(head + [summary_block] + tail)
+        messages.extend([new_first] + tail)
         self.compactions += 1
         return f"compacted {len(mid)} messages into summary (compaction #{self.compactions})"
 

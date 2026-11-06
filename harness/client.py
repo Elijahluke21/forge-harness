@@ -14,6 +14,7 @@ Anthropic tool_result block (inside a user message):
 
 import json
 import os
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -38,6 +39,9 @@ class ToolCall:
     id: str
     name: str
     input: dict
+    # Set when the model emitted arguments that are not valid JSON. The loop
+    # reports this back to the model instead of executing the call.
+    error: str = ""
 
 
 @dataclass
@@ -107,13 +111,13 @@ class AnthropicClient(BaseClient):
             return await self._send_streaming(kwargs, on_text_chunk)
 
         msg = await self._api.messages.create(**kwargs)
-        text, tool_calls = "", []
+        text_parts, tool_calls = [], []
         for block in msg.content:
             if block.type == "text":
-                text = block.text
+                text_parts.append(block.text)   # keep every text block, not just the last
             elif block.type == "tool_use":
                 tool_calls.append(ToolCall(id=block.id, name=block.name, input=block.input))
-        return Response(text=text, tool_calls=tool_calls,
+        return Response(text="".join(text_parts), tool_calls=tool_calls,
                         input_tokens=msg.usage.input_tokens,
                         output_tokens=msg.usage.output_tokens)
 
@@ -208,14 +212,10 @@ class OllamaClient(BaseClient):
                         if tc_delta.function.arguments:
                             tc_fragments[idx]["arguments"] += tc_delta.function.arguments
 
-        tool_calls = []
-        for idx in sorted(tc_fragments):
-            frag = tc_fragments[idx]
-            try:
-                inp = json.loads(frag["arguments"]) if frag["arguments"] else {}
-            except json.JSONDecodeError:
-                inp = {}
-            tool_calls.append(ToolCall(id=frag["id"], name=frag["name"], input=inp))
+        tool_calls = [
+            _make_tool_call(frag["id"], frag["name"], frag["arguments"])
+            for _, frag in sorted(tc_fragments.items())
+        ]
 
         return Response(
             text="".join(text_parts),
@@ -231,11 +231,7 @@ class OllamaClient(BaseClient):
         tool_calls = []
         if msg.tool_calls:
             for tc in msg.tool_calls:
-                tool_calls.append(ToolCall(
-                    id=tc.id,
-                    name=tc.function.name,
-                    input=json.loads(tc.function.arguments),
-                ))
+                tool_calls.append(_make_tool_call(tc.id, tc.function.name, tc.function.arguments))
         usage = completion.usage
         return Response(
             text=text,
@@ -299,11 +295,33 @@ class OllamaClient(BaseClient):
         ]
 
 
+def _make_tool_call(call_id: str | None, name: str, arguments: str | None) -> ToolCall:
+    """
+    Build a ToolCall from OpenAI-format pieces. Local models regularly emit
+    malformed argument JSON; instead of crashing the run (json.loads raising)
+    or silently calling the tool with no arguments, flag the call so the loop
+    can tell the model exactly what went wrong.
+    """
+    call_id = call_id or f"call_{uuid.uuid4().hex[:12]}"
+    if not arguments:
+        return ToolCall(id=call_id, name=name, input={})
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError as exc:
+        return ToolCall(id=call_id, name=name, input={},
+                        error=f"arguments were not valid JSON ({exc}): {arguments[:200]}")
+    if not isinstance(parsed, dict):
+        return ToolCall(id=call_id, name=name, input={},
+                        error=f"arguments must be a JSON object, got: {arguments[:200]}")
+    return ToolCall(id=call_id, name=name, input=parsed)
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 def make_client(backend: str = "ollama", **kwargs) -> BaseClient:
+    kwargs = {k: v for k, v in kwargs.items() if v}
     if backend == "anthropic":
         return AnthropicClient(**kwargs)
     if backend == "ollama":

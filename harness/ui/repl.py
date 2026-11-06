@@ -1,18 +1,18 @@
 import asyncio
 import json
-import subprocess
 from pathlib import Path
 
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.text import Text
 
 from harness.agent import Agent, SpawnEvent
+from harness.budget import HarnessAbort
 from harness.context import checkpoint
 from harness.memory.distill import distill
-from harness.prompt import build_system_prompt
 
 console = Console()
 
@@ -161,32 +161,12 @@ async def confirm_tool(name: str, inputs: dict) -> bool:
     preview = ", ".join(f"{k}={repr(str(v)[:60])}" for k, v in inputs.items())
     console.print(f"\n[yellow]⚠  Permission required:[/yellow] [bold]{name}[/bold]({preview})")
     try:
-        answer = await asyncio.get_event_loop().run_in_executor(
+        answer = await asyncio.get_running_loop().run_in_executor(
             None, lambda: input("  Allow? [y/N] ")
         )
         return answer.strip().lower() in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
         return False
-
-
-# ---------------------------------------------------------------------------
-# Hooks  (6.4)
-# ---------------------------------------------------------------------------
-
-def run_hooks(hooks: list[dict], timing: str, tool_name: str) -> None:
-    for hook in hooks:
-        if hook.get("on") != timing:
-            continue
-        pattern = hook.get("tool", "*")
-        if pattern != "*" and pattern != tool_name:
-            continue
-        cmd = hook.get("cmd", "")
-        if cmd:
-            try:
-                subprocess.run(cmd, shell=True, check=False,
-                               env={"FORGE_TOOL": tool_name})
-            except Exception:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +209,7 @@ def _print_stats(agent: Agent) -> None:
 
 
 async def _run_distill(agent: Agent) -> None:
-    if not agent.memory_store:
+    if agent.memory_store is None:
         console.print("[dim]No memory store attached.[/dim]")
         return
     console.print("[dim]Distilling...[/dim]")
@@ -255,6 +235,8 @@ def _handle_command(raw: str, agent: Agent) -> bool:
         return True
     if cmd == "/clear":
         agent.messages.clear()
+        if agent.context_manager:
+            agent.context_manager.last_input_tokens = 0
         console.print("[dim]History cleared.[/dim]")
     elif cmd == "/history":
         console.print(f"[dim]{len(agent.messages)} messages in history.[/dim]")
@@ -272,7 +254,7 @@ def _handle_command(raw: str, agent: Agent) -> bool:
         except FileNotFoundError:
             console.print(f"[red]File not found:[/red] {path}")
     elif cmd == "/memory":
-        if not agent.memory_store:
+        if agent.memory_store is None:
             console.print("[dim]No memory store attached.[/dim]")
         else:
             entries = agent.memory_store.all()
@@ -281,11 +263,11 @@ def _handle_command(raw: str, agent: Agent) -> bool:
             else:
                 console.print(Rule("Memory", style="dim"))
                 for e in entries:
-                    tag_str = f" [dim][{', '.join(e.tags)}][/dim]" if e.tags else ""
-                    console.print(f"  [bold cyan]{e.key}[/bold cyan]{tag_str}: {e.content}")
+                    tag_str = f" [{', '.join(e.tags)}]" if e.tags else ""
+                    console.print(f"  [bold cyan]{escape(e.key)}[/bold cyan]{escape(tag_str)}: {escape(e.content)}")
                 console.print(Rule(style="dim"))
     elif cmd == "/forget":
-        if not agent.memory_store:
+        if agent.memory_store is None:
             console.print("[dim]No memory store.[/dim]")
         elif not arg:
             console.print("[red]Usage:[/red] /forget <key>")
@@ -308,32 +290,35 @@ def _handle_command(raw: str, agent: Agent) -> bool:
     elif cmd == "/help":
         console.print(Rule("Commands", style="dim"))
         for c, desc in COMMANDS.items():
-            console.print(f"  [bold cyan]{c:<24}[/bold cyan] {desc}")
+            # escape(): "[path]" would otherwise be eaten as Rich markup
+            console.print(f"  [bold cyan]{escape(c):<24}[/bold cyan] {desc}")
         console.print(Rule(style="dim"))
     else:
         console.print(f"[red]Unknown command:[/red] {cmd}  (type /help)")
     return False
 
 
+def _drop_unfinished_turn(agent: Agent) -> None:
+    """
+    After an abort the history can end mid-turn (a tool_use with no result),
+    which the API rejects on the next message. Roll back to before the last
+    plain user message.
+    """
+    for i in range(len(agent.messages) - 1, -1, -1):
+        msg = agent.messages[i]
+        if msg["role"] == "user" and isinstance(msg.get("content"), str):
+            del agent.messages[i:]
+            return
+
+
 # ---------------------------------------------------------------------------
 # Main REPL
 # ---------------------------------------------------------------------------
 
-async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = None) -> None:
+async def repl(agent: Agent, stream: bool = True) -> None:
+    # Hooks and permissions are configured on the tool registries (harness.app),
+    # so they apply to sub-agents too — not just the orchestrator.
     _print_banner(agent)
-    _hooks = hooks or []
-
-    # Wrap tool registry with hook execution
-    if _hooks:
-        orig_execute = agent.registry.execute
-
-        async def hooked_execute(name: str, inputs: dict) -> str:
-            run_hooks(_hooks, "pre", name)
-            result = await orig_execute(name, inputs)
-            run_hooks(_hooks, "post", name)
-            return result
-
-        agent.registry.execute = hooked_execute  # type: ignore
 
     while True:
         try:
@@ -341,7 +326,7 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
             if agent.session_stats and agent.session_stats.agents_spawned:
                 s = agent.session_stats
                 prompt = f"forge [{s.agents_spawned}↓ {s.tool_calls}⚙]> "
-            user_input = await asyncio.get_event_loop().run_in_executor(
+            user_input = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: input(prompt)
             )
         except (EOFError, KeyboardInterrupt):
@@ -363,7 +348,7 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
                 continue
             if _handle_command(user_input, agent):
                 _print_stats(agent)
-                if agent.memory_store and agent.messages:
+                if agent.memory_store is not None and agent.messages:
                     console.print("[dim]Distilling session memories...[/dim]")
                     await _run_distill(agent)
                 break
@@ -385,6 +370,12 @@ async def repl(agent: Agent, stream: bool = True, hooks: list[dict] | None = Non
             console.print("\n[yellow]Interrupted.[/yellow]")
             if agent.messages and agent.messages[-1]["role"] == "user":
                 agent.messages.pop()
+            continue
+        except HarnessAbort as exc:
+            if renderer:
+                renderer.flush()
+            console.print(f"\n[bold red]Stopped:[/bold red] {exc}")
+            _drop_unfinished_turn(agent)
             continue
         finally:
             agent.on_stream_chunk = None
