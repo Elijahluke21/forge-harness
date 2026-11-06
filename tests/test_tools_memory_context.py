@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -40,7 +42,10 @@ async def test_symlink_escape_blocked(ws_reg, tmp_path_factory):
     root, reg = ws_reg
     outside = tmp_path_factory.mktemp("outside")
     (outside / "secret").write_text("s")
-    os.symlink(outside, root / "link")
+    try:
+        os.symlink(outside, root / "link")
+    except OSError:
+        pytest.skip("symlinks need admin or Developer Mode on Windows")
     assert "outside the workspace" in await reg.execute("read_file", {"path": "link/secret"})
 
 
@@ -66,14 +71,17 @@ async def test_read_file_truncation_says_where_to_continue(ws_reg):
 
 async def test_bash_runs_in_workspace(ws_reg):
     root, reg = ws_reg
-    assert (await reg.execute("bash", {"command": "pwd"})).strip() == str(root.resolve())
+    # Git Bash prints /c/Users/... (or /tmp/...); `pwd -W` gives the native C:/... form.
+    pwd = "pwd -W" if sys.platform == "win32" else "pwd"
+    out = (await reg.execute("bash", {"command": pwd})).strip()
+    assert Path(out).resolve() == root.resolve()
 
 
 async def test_bash_timeout_kills_whole_process_group(ws_reg):
     root, reg = ws_reg
     marker = root / "child_alive"
     # The background child would create the marker after 3s if it survived.
-    cmd = f"(sleep 3; touch {marker}) & sleep 30"
+    cmd = f"(sleep 3; touch {marker.as_posix()}) & sleep 30"
     start = time.monotonic()
     out = await reg.execute("bash", {"command": cmd, "timeout": 1})
     assert "timed out" in out and time.monotonic() - start < 10

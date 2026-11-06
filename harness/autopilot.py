@@ -40,6 +40,7 @@ from harness.client import BaseClient
 from harness.executor import PlanError, execute_plan, plan_to_json, summarize
 from harness.planning import generate_plan
 from harness.tools.registry import ToolRegistry
+from harness.tools.shell import spawn_shell
 
 
 @dataclass
@@ -240,7 +241,7 @@ class Autopilot:
             "FORGE_SUMMARY": f"{result.status}: {result.reason}"[:300],
         }
         try:
-            proc = await asyncio.create_subprocess_shell(
+            proc = await spawn_shell(
                 self.cfg.on_finish, env=env,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )

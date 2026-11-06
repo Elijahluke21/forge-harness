@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 from harness.tools.registry import ToolRegistry
+from harness.tools.shell import spawn_shell
 from harness.tools.workspace import Workspace
 
 MAX_OUTPUT_CHARS = 8_000
@@ -28,7 +29,7 @@ async def run_shell(
         {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         if sys.platform == "win32" else {"start_new_session": True}
     )
-    proc = await asyncio.create_subprocess_shell(
+    proc = await spawn_shell(
         command,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,

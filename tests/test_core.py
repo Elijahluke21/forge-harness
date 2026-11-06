@@ -155,7 +155,7 @@ async def test_subset_keeps_permissions():
 async def test_hooks_keep_path_and_report_status(tmp_path):
     out = tmp_path / "hook.txt"
     reg = _echo_registry()
-    reg.set_hooks([{"on": "post", "tool": "*", "cmd": f'echo "$FORGE_TOOL $FORGE_RESULT_STATUS" > {out}; command -v sh >> {out}'}])
+    reg.set_hooks([{"on": "post", "tool": "*", "cmd": f'echo "$FORGE_TOOL $FORGE_RESULT_STATUS" > {out.as_posix()}; command -v sh >> {out.as_posix()}'}])
     await reg.execute("echo", {"msg": "x"})
     content = out.read_text()
     assert content.startswith("echo ok")

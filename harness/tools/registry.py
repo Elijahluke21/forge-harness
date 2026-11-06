@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from harness.budget import HarnessAbort
+from harness.tools.shell import spawn_shell
 
 
 @dataclass
@@ -95,7 +96,7 @@ class ToolRegistry:
             # hook silently fails to find any command.
             env = {**os.environ, "FORGE_TOOL": tool_name, **(extra_env or {})}
             try:
-                proc = await asyncio.create_subprocess_shell(
+                proc = await spawn_shell(
                     cmd, env=env,
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 )
